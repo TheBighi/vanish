@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { api } from '../services/api.js'
+import { adoptPendingIdentity, generateIdentity, stageIdentity, storeIdentity } from '../services/messageCrypto.js'
 
 export default function AuthPage({ onAuthenticated }) {
   const [mode, setMode] = useState('login')
@@ -14,7 +15,24 @@ export default function AuthPage({ onAuthenticated }) {
     setLoading(true)
     try {
       const credentials = { username: form.username.trim(), password: form.password }
-      const payload = mode === 'login' ? await api.login(credentials) : await api.register(credentials)
+      let identity
+      let payload
+      if (mode === 'register') {
+        identity = await generateIdentity()
+        await stageIdentity(credentials.username, identity)
+        payload = await api.register({ ...credentials, public_key: identity.publicKey })
+        await storeIdentity(payload.user.id, identity)
+        await adoptPendingIdentity(credentials.username, payload.user)
+      } else {
+        payload = await api.login(credentials)
+        if (!payload.user.public_key) {
+          identity = await generateIdentity()
+          payload.user = await api.setEncryptionKey(payload.access_token, identity.publicKey)
+          await storeIdentity(payload.user.id, identity)
+        } else {
+          await adoptPendingIdentity(credentials.username, payload.user)
+        }
+      }
       onAuthenticated(payload)
     } catch (requestError) {
       setError(requestError.message)
@@ -53,7 +71,7 @@ export default function AuthPage({ onAuthenticated }) {
           <button className="primary-button" disabled={loading}>
             {loading ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}
           </button>
-          <p className="privacy-note">End-to-end encryption is not implemented.</p>
+          <p className="privacy-note">Messages and images are end-to-end encrypted.</p>
         </form>
       </section>
     </main>

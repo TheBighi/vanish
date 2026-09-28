@@ -1,30 +1,23 @@
-import math
-from io import BytesIO
-from pathlib import Path
+import base64
+import binascii
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
-from PIL import Image, UnidentifiedImageError
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..auth import get_current_user
 from ..database import get_db
 from ..models import ConversationMember, Message, MessageAttachment, MessageStatus, User
-from ..schemas import MessageCreate, MessageOut
+from ..schemas import EncryptedAttachmentOut, EncryptedMessageCreate, MessageOut
 from ..websocket import manager
 from .conversations import conversation_for_user
 
 
 router = APIRouter(tags=["messages"])
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_ENCRYPTED_IMAGE_BYTES = 5 * 1024 * 1024 + 4096
 IMAGE_DISPLAY_SECONDS = 10
-IMAGE_MIME_TYPES = {
-    "JPEG": "image/jpeg",
-    "PNG": "image/png",
-    "GIF": "image/gif",
-    "WEBP": "image/webp",
-}
+TEXT_DISPLAY_SECONDS = 10
 
 
 def aware(value: datetime | None) -> datetime | None:
@@ -33,8 +26,18 @@ def aware(value: datetime | None) -> datetime | None:
     return value
 
 
-def display_seconds(content: str) -> int:
-    return max(2, min(30, math.ceil(len(content) / 15)))
+def decode_encryption_metadata(nonce: str, sender_key: str, recipient_key: str) -> tuple[bytes, bytes, bytes]:
+    try:
+        decoded = (
+            base64.b64decode(nonce, validate=True),
+            base64.b64decode(sender_key, validate=True),
+            base64.b64decode(recipient_key, validate=True),
+        )
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid encryption metadata") from exc
+    if len(decoded[0]) != 12 or not (128 <= len(decoded[1]) <= 1024) or not (128 <= len(decoded[2]) <= 1024):
+        raise HTTPException(status_code=422, detail="Invalid encryption metadata")
+    return decoded
 
 
 def serialize_message(message: Message, viewer_id: int, reveal: bool = False) -> MessageOut:
@@ -42,15 +45,19 @@ def serialize_message(message: Message, viewer_id: int, reveal: bool = False) ->
     expires_at = aware(message.expires_at)
     currently_visible = message.status == MessageStatus.opened and expires_at and expires_at > now
     can_see = message.sender_id == viewer_id or reveal or (message.recipient_id == viewer_id and currently_visible)
-    content = message.content if can_see and message.status != MessageStatus.expired else None
+    can_reveal = can_see and message.status != MessageStatus.expired
     is_image = message.attachment is not None
-    seconds = (IMAGE_DISPLAY_SECONDS if is_image else display_seconds(message.content)) if message.opened_at else None
+    encrypted_key = message.sender_key if message.sender_id == viewer_id else message.recipient_key
+    seconds = (IMAGE_DISPLAY_SECONDS if is_image else TEXT_DISPLAY_SECONDS) if message.opened_at else None
     return MessageOut(
         id=message.id,
         conversation_id=message.conversation_id,
         sender_id=message.sender_id,
         recipient_id=message.recipient_id,
-        content=content,
+        content=None,
+        ciphertext=base64.b64encode(message.encrypted_content).decode("ascii") if message.encrypted_content and can_reveal else None,
+        nonce=message.nonce if message.encrypted_content and can_reveal else None,
+        encrypted_key=encrypted_key if message.encrypted_content and can_reveal else None,
         created_at=aware(message.created_at),
         delivered_at=aware(message.delivered_at),
         opened_at=aware(message.opened_at),
@@ -58,7 +65,7 @@ def serialize_message(message: Message, viewer_id: int, reveal: bool = False) ->
         status=message.status.value,
         display_seconds=seconds,
         kind="image" if is_image else "text",
-        attachment_name=message.attachment.filename if is_image and can_see and message.status != MessageStatus.expired else None,
+        attachment_name=None,
     )
 
 
@@ -74,8 +81,15 @@ def expire_due_messages(db: Session) -> list[tuple[int, int, int]]:
     events = [(item.id, item.sender_id, item.recipient_id) for item in due]
     for item in due:
         item.content = None
+        item.encrypted_content = None
+        item.nonce = None
+        item.sender_key = None
+        item.recipient_key = None
         if item.attachment:
             item.attachment.data = None
+            item.attachment.nonce = None
+            item.attachment.sender_key = None
+            item.attachment.recipient_key = None
         item.status = MessageStatus.expired
     if due:
         db.commit()
@@ -104,7 +118,7 @@ async def list_messages(
 
 @router.post("/messages", response_model=MessageOut, status_code=status.HTTP_201_CREATED)
 async def send_message(
-    payload: MessageCreate,
+    payload: EncryptedMessageCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -118,16 +132,29 @@ async def send_message(
     if not recipient_id:
         raise HTTPException(status_code=400, detail="Conversation has no recipient")
 
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(status_code=422, detail="Message cannot be blank")
+    if not current_user.public_key:
+        raise HTTPException(status_code=409, detail="Set up message encryption before sending messages")
+    recipient = db.get(User, recipient_id)
+    if not recipient or not recipient.public_key:
+        raise HTTPException(status_code=409, detail="Recipient has not set up message encryption")
+    try:
+        ciphertext = base64.b64decode(payload.ciphertext, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid encrypted message") from exc
+    if not (16 < len(ciphertext) <= 4096):
+        raise HTTPException(status_code=422, detail="Invalid encrypted message")
+    decode_encryption_metadata(payload.nonce, payload.sender_key, payload.recipient_key)
+
     now = datetime.now(timezone.utc)
     is_delivered = manager.is_online(recipient_id)
     message = Message(
         conversation_id=payload.conversation_id,
         sender_id=current_user.id,
         recipient_id=recipient_id,
-        content=content,
+        encrypted_content=ciphertext,
+        nonce=payload.nonce,
+        sender_key=payload.sender_key,
+        recipient_key=payload.recipient_key,
         delivered_at=now if is_delivered else None,
         status=MessageStatus.delivered if is_delivered else MessageStatus.sent,
     )
@@ -147,6 +174,9 @@ async def send_message(
 async def send_image(
     conversation_id: int = Form(),
     file: UploadFile = File(),
+    nonce: str = Form(),
+    sender_key: str = Form(),
+    recipient_key: str = Form(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -160,20 +190,19 @@ async def send_image(
     if not recipient_id:
         raise HTTPException(status_code=400, detail="Conversation has no recipient")
 
-    data = await file.read(MAX_IMAGE_BYTES + 1)
+    if not current_user.public_key:
+        raise HTTPException(status_code=409, detail="Set up image encryption before sending images")
+    recipient = db.get(User, recipient_id)
+    if not recipient or not recipient.public_key:
+        raise HTTPException(status_code=409, detail="Recipient has not set up image encryption")
+
+    data = await file.read(MAX_ENCRYPTED_IMAGE_BYTES + 1)
     await file.close()
-    if not data:
-        raise HTTPException(status_code=422, detail="Image cannot be empty")
-    if len(data) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="Image must be 5 MB or smaller")
-    try:
-        with Image.open(BytesIO(data)) as image:
-            image.verify()
-            mime_type = IMAGE_MIME_TYPES.get(image.format)
-    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
-        raise HTTPException(status_code=422, detail="File is not a valid image") from exc
-    if not mime_type:
-        raise HTTPException(status_code=415, detail="Only JPEG, PNG, GIF, and WebP images are supported")
+    if len(data) <= 16:
+        raise HTTPException(status_code=422, detail="Encrypted image cannot be empty")
+    if len(data) > MAX_ENCRYPTED_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Encrypted image is too large")
+    decode_encryption_metadata(nonce, sender_key, recipient_key)
 
     now = datetime.now(timezone.utc)
     is_delivered = manager.is_online(recipient_id)
@@ -186,8 +215,11 @@ async def send_image(
     )
     message.attachment = MessageAttachment(
         data=data,
-        mime_type=mime_type,
-        filename=Path(file.filename or "image").name[:255],
+        mime_type="application/octet-stream",
+        filename="encrypted-image",
+        nonce=nonce,
+        sender_key=sender_key,
+        recipient_key=recipient_key,
     )
     db.add(message)
     db.commit()
@@ -201,9 +233,10 @@ async def send_image(
     return sender_view
 
 
-@router.get("/messages/{message_id}/attachment")
+@router.get("/messages/{message_id}/attachment", response_model=EncryptedAttachmentOut)
 async def get_attachment(
     message_id: int,
+    response: Response,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -217,10 +250,14 @@ async def get_attachment(
         raise HTTPException(status_code=410, detail="Image has expired")
     if message.recipient_id == current_user.id and message.status != MessageStatus.opened:
         raise HTTPException(status_code=403, detail="Image has not been opened")
-    return Response(
-        content=message.attachment.data,
-        media_type=message.attachment.mime_type,
-        headers={"Cache-Control": "no-store"},
+    encrypted_key = message.attachment.sender_key if current_user.id == message.sender_id else message.attachment.recipient_key
+    if not message.attachment.nonce or not encrypted_key:
+        raise HTTPException(status_code=410, detail="Image encryption data is unavailable")
+    response.headers["Cache-Control"] = "no-store"
+    return EncryptedAttachmentOut(
+        ciphertext=base64.b64encode(message.attachment.data).decode("ascii"),
+        nonce=message.attachment.nonce,
+        encrypted_key=encrypted_key,
     )
 
 
@@ -238,10 +275,11 @@ async def open_message(
     if message.recipient_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the intended recipient can open this message")
     has_image = message.attachment is not None and message.attachment.data is not None
-    if message.status == MessageStatus.expired or (not message.content and not has_image):
+    has_text = message.encrypted_content is not None
+    if message.status == MessageStatus.expired or (not has_text and not has_image):
         raise HTTPException(status_code=410, detail="Message has expired")
 
-    seconds = IMAGE_DISPLAY_SECONDS if has_image else display_seconds(message.content)
+    seconds = IMAGE_DISPLAY_SECONDS if has_image else TEXT_DISPLAY_SECONDS
     result = db.execute(
         update(Message)
         .where(

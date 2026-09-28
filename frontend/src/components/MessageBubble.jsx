@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../services/api.js'
+import { decryptImage, decryptText } from '../services/messageCrypto.js'
 
 function formatTime(value) {
   return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -12,10 +13,13 @@ function senderStatus(message) {
   return message.status === 'sending' ? 'Sending…' : 'Sent'
 }
 
-export default function MessageBubble({ message, mine, token, onOpen }) {
+export default function MessageBubble({ message, mine, user, token, onOpen }) {
   const [remaining, setRemaining] = useState(null)
   const [imageUrl, setImageUrl] = useState(null)
   const [imageError, setImageError] = useState(false)
+  const [imageName, setImageName] = useState('Disappearing image')
+  const [text, setText] = useState(null)
+  const [textError, setTextError] = useState(false)
   const openedAndVisible = !mine && message.opened_at && message.status === 'opened' && message.expires_at
 
   useEffect(() => {
@@ -42,9 +46,11 @@ export default function MessageBubble({ message, mine, token, onOpen }) {
     let objectUrl
     setImageError(false)
     api.messageAttachment(token, message.id)
-      .then((blob) => {
+      .then((payload) => decryptImage(payload, user))
+      .then(({ blob, name }) => {
         if (disposed) return
         objectUrl = URL.createObjectURL(blob)
+        setImageName(name)
         setImageUrl(objectUrl)
       })
       .catch(() => !disposed && setImageError(true))
@@ -52,7 +58,22 @@ export default function MessageBubble({ message, mine, token, onOpen }) {
       disposed = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [message.id, message.kind, message.opened_at, message.status, mine, token])
+  }, [message.id, message.kind, message.opened_at, message.status, mine, token, user])
+
+  useEffect(() => {
+    const canDecrypt = message.kind === 'text' && message.status !== 'expired' && message.ciphertext && (mine || message.opened_at)
+    if (!canDecrypt) {
+      setText(null)
+      setTextError(false)
+      return undefined
+    }
+    let disposed = false
+    setTextError(false)
+    decryptText(message, user)
+      .then((content) => !disposed && setText(content))
+      .catch(() => !disposed && setTextError(true))
+    return () => { disposed = true }
+  }, [message, mine, user])
 
   if (!mine && !message.opened_at && message.status !== 'expired') {
     return (
@@ -74,8 +95,8 @@ export default function MessageBubble({ message, mine, token, onOpen }) {
   return (
     <div className={`message-line ${mine ? 'outgoing' : 'incoming'}`}>
       {message.kind === 'image'
-        ? <div className="image-message">{imageUrl ? <img src={imageUrl} alt={message.attachment_name || 'Disappearing image'} /> : <span>{imageError ? 'Image unavailable' : 'Loading image…'}</span>}</div>
-        : <div className="message-bubble">{message.content}</div>}
+        ? <div className="image-message">{imageUrl ? <img src={imageUrl} alt={imageName} /> : <span>{imageError ? 'Image unavailable' : 'Decrypting image…'}</span>}</div>
+        : <div className="message-bubble">{text || (textError ? 'Message unavailable' : 'Decrypting message…')}</div>}
       <div className="message-info">
         <time>{formatTime(message.created_at)}</time>
         {mine && <span>{senderStatus(message)}</span>}

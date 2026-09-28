@@ -48,17 +48,31 @@ export const api = {
     body: JSON.stringify({ username }),
   }),
   messages: (token, conversationId) => request(`/conversations/${conversationId}/messages`, { token }),
-  sendMessage: (token, conversationId, content) => request('/messages', {
+  sendMessage: (token, conversationId, encrypted) => request('/messages', {
     token,
     method: 'POST',
-    body: JSON.stringify({ conversation_id: conversationId, content }),
+    body: JSON.stringify({
+      conversation_id: conversationId,
+      ciphertext: encrypted.ciphertext,
+      nonce: encrypted.nonce,
+      sender_key: encrypted.senderKey,
+      recipient_key: encrypted.recipientKey,
+    }),
   }),
-  sendImage: (token, conversationId, file) => {
+  setEncryptionKey: (token, publicKey) => request('/users/me/encryption-key', {
+    token,
+    method: 'PUT',
+    body: JSON.stringify({ public_key: publicKey }),
+  }),
+  sendImage: (token, conversationId, encrypted) => {
     const body = new FormData()
     body.append('conversation_id', conversationId)
-    body.append('file', file)
+    body.append('file', encrypted.ciphertext, 'encrypted-image')
+    body.append('nonce', encrypted.nonce)
+    body.append('sender_key', encrypted.senderKey)
+    body.append('recipient_key', encrypted.recipientKey)
     return request('/messages/image', { token, method: 'POST', body })
   },
-  messageAttachment: (token, messageId) => request(`/messages/${messageId}/attachment`, { token, responseType: 'blob' }),
+  messageAttachment: (token, messageId) => request(`/messages/${messageId}/attachment`, { token }),
   openMessage: (token, messageId) => request(`/messages/${messageId}/open`, { token, method: 'POST' }),
 }

@@ -3,15 +3,21 @@ import AuthPage from './pages/AuthPage.jsx'
 import ChatPage from './pages/ChatPage.jsx'
 import { api, ApiError } from './services/api.js'
 import { clearSession, getSession, saveSession, updateStoredUser } from './services/auth.js'
+import { generateIdentity, storeIdentity } from './services/messageCrypto.js'
 
 export default function App() {
   const [session, setSession] = useState(getSession)
-  const [checking, setChecking] = useState(Boolean(session?.token && !session?.user))
+  const [checking, setChecking] = useState(Boolean(session?.token))
 
   useEffect(() => {
-    if (!session?.token || session.user) return
+    if (!session?.token) return
     api.me(session.token)
-      .then((user) => {
+      .then(async (user) => {
+        if (!user.public_key) {
+          const identity = await generateIdentity()
+          user = await api.setEncryptionKey(session.token, identity.publicKey)
+          await storeIdentity(user.id, identity)
+        }
         updateStoredUser(user)
         setSession((current) => ({ ...current, user }))
       })
@@ -22,7 +28,7 @@ export default function App() {
         }
       })
       .finally(() => setChecking(false))
-  }, [session?.token, session?.user])
+  }, [session?.token])
 
   function handleAuthenticated(payload) {
     setSession(saveSession(payload))

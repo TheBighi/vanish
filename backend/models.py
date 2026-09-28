@@ -24,6 +24,7 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     username = Column(String(32), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
+    public_key = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -52,6 +53,10 @@ class Message(Base):
     sender_id = Column(ForeignKey("users.id"), nullable=False, index=True)
     recipient_id = Column(ForeignKey("users.id"), nullable=False, index=True)
     content = Column(Text, nullable=True)
+    encrypted_content = Column(LargeBinary, nullable=True)
+    nonce = Column(String(64), nullable=True)
+    sender_key = Column(Text, nullable=True)
+    recipient_key = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     delivered_at = Column(DateTime(timezone=True), nullable=True)
     opened_at = Column(DateTime(timezone=True), nullable=True)
@@ -67,4 +72,7 @@ class MessageAttachment(Base):
     data = Column(LargeBinary, nullable=True)
     mime_type = Column(String(32), nullable=False)
     filename = Column(String(255), nullable=False)
+    nonce = Column(String(64), nullable=True)
+    sender_key = Column(Text, nullable=True)
+    recipient_key = Column(Text, nullable=True)
     message = relationship("Message", back_populates="attachment")

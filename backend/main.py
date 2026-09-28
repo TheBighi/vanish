@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
 
 from .auth import SECRET_KEY, decode_token
 from .database import Base, SessionLocal, engine
@@ -21,11 +21,39 @@ async def cleanup_expired_messages() -> None:
         await messages.notify_expired(events)
 
 
+def migrate_encryption_columns() -> None:
+    columns = inspect(engine).get_columns("users")
+    message_columns = inspect(engine).get_columns("messages")
+    attachment_columns = inspect(engine).get_columns("message_attachments")
+    with engine.begin() as connection:
+        if "public_key" not in {column["name"] for column in columns}:
+            connection.execute(text("ALTER TABLE users ADD COLUMN public_key TEXT"))
+        existing_messages = {column["name"] for column in message_columns}
+        for name, column_type in (("encrypted_content", "BLOB"), ("nonce", "VARCHAR(64)"), ("sender_key", "TEXT"), ("recipient_key", "TEXT")):
+            if name not in existing_messages:
+                connection.execute(text(f"ALTER TABLE messages ADD COLUMN {name} {column_type}"))
+        existing = {column["name"] for column in attachment_columns}
+        for name, column_type in (("nonce", "VARCHAR(64)"), ("sender_key", "TEXT"), ("recipient_key", "TEXT")):
+            if name not in existing:
+                connection.execute(text(f"ALTER TABLE message_attachments ADD COLUMN {name} {column_type}"))
+        # Legacy attachments contain plaintext and cannot safely remain after enabling E2E images.
+        connection.execute(text("UPDATE message_attachments SET data = NULL WHERE data IS NOT NULL AND nonce IS NULL"))
+        connection.execute(text("""
+            UPDATE messages SET content = NULL, status = 'expired'
+            WHERE id IN (SELECT message_id FROM message_attachments WHERE nonce IS NULL)
+        """))
+        connection.execute(text("""
+            UPDATE messages SET content = NULL, status = 'expired'
+            WHERE content IS NOT NULL AND encrypted_content IS NULL
+        """))
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     if not SECRET_KEY:
         raise RuntimeError("SECRET_KEY environment variable is required")
     Base.metadata.create_all(bind=engine)
+    migrate_encryption_columns()
     cleanup_task = asyncio.create_task(cleanup_expired_messages())
     yield
     cleanup_task.cancel()

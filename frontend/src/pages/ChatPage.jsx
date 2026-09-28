@@ -4,11 +4,18 @@ import SearchDialog from '../components/SearchDialog.jsx'
 import Sidebar from '../components/Sidebar.jsx'
 import { useSocket } from '../hooks/useSocket.js'
 import { api, ApiError } from '../services/api.js'
+import { encryptImage, encryptText, hasIdentity } from '../services/messageCrypto.js'
 
 function normalizeMessage(message, userId) {
   const expired = message.expires_at && new Date(message.expires_at).getTime() <= Date.now()
   const unopenedIncoming = message.recipient_id === userId && !message.opened_at
-  return { ...message, content: expired || unopenedIncoming ? null : message.content, status: expired ? 'expired' : message.status }
+  return {
+    ...message,
+    ciphertext: expired || unopenedIncoming ? null : message.ciphertext,
+    nonce: expired || unopenedIncoming ? null : message.nonce,
+    encrypted_key: expired || unopenedIncoming ? null : message.encrypted_key,
+    status: expired ? 'expired' : message.status,
+  }
 }
 
 function upsertMessage(list = [], incoming) {
@@ -17,8 +24,14 @@ function upsertMessage(list = [], incoming) {
   const next = [...list]
   const existing = next[index]
   const hasExpired = incoming.status === 'expired' || (incoming.expires_at && new Date(incoming.expires_at).getTime() <= Date.now())
-  const content = incoming.content == null && existing.content && !hasExpired ? existing.content : incoming.content
-  next[index] = { ...existing, ...incoming, content }
+  const preserveEncryption = incoming.ciphertext == null && existing.ciphertext && !hasExpired
+  next[index] = {
+    ...existing,
+    ...incoming,
+    ciphertext: preserveEncryption ? existing.ciphertext : incoming.ciphertext,
+    nonce: preserveEncryption ? existing.nonce : incoming.nonce,
+    encrypted_key: preserveEncryption ? existing.encrypted_key : incoming.encrypted_key,
+  }
   return next
 }
 
@@ -42,7 +55,7 @@ export default function ChatPage({ session, onLogout }) {
         Object.entries(current).map(([conversationId, items]) => [
           conversationId,
           items.map((message) => message.id === data.message_id
-            ? { ...message, content: null, status: 'expired' }
+            ? { ...message, ciphertext: null, nonce: null, encrypted_key: null, status: 'expired' }
             : message),
         ]),
       ))
@@ -82,10 +95,10 @@ export default function ChatPage({ session, onLogout }) {
       if (!message.expires_at || message.status === 'expired') return
       const delay = new Date(message.expires_at).getTime() - Date.now()
       if (delay <= 0) {
-        setMessages((current) => ({ ...current, [message.conversation_id]: (current[message.conversation_id] || []).map((item) => item.id === message.id ? { ...item, content: null, status: 'expired' } : item) }))
+        setMessages((current) => ({ ...current, [message.conversation_id]: (current[message.conversation_id] || []).map((item) => item.id === message.id ? { ...item, ciphertext: null, nonce: null, encrypted_key: null, status: 'expired' } : item) }))
       } else {
         timers.push(window.setTimeout(() => {
-          setMessages((current) => ({ ...current, [message.conversation_id]: (current[message.conversation_id] || []).map((item) => item.id === message.id ? { ...item, content: null, status: 'expired' } : item) }))
+          setMessages((current) => ({ ...current, [message.conversation_id]: (current[message.conversation_id] || []).map((item) => item.id === message.id ? { ...item, ciphertext: null, nonce: null, encrypted_key: null, status: 'expired' } : item) }))
         }, delay))
       }
     })
@@ -125,6 +138,11 @@ export default function ChatPage({ session, onLogout }) {
 
   async function openMessage(messageId) {
     const conversationId = activeIdRef.current
+    const message = messages[conversationId]?.find((item) => item.id === messageId)
+    if (!await hasIdentity(user)) {
+      setError('This browser does not have the private key for this message. It was left sealed.')
+      return
+    }
     setMessages((current) => ({ ...current, [conversationId]: current[conversationId].map((item) => item.id === messageId ? { ...item, opening: true } : item) }))
     try {
       const opened = normalizeMessage(await api.openMessage(token, messageId), user.id)
@@ -141,7 +159,9 @@ export default function ChatPage({ session, onLogout }) {
   async function sendMessage(content) {
     setError('')
     try {
-      const sent = normalizeMessage(await api.sendMessage(token, activeId, content), user.id)
+      if (!await hasIdentity(user)) throw new Error('This browser does not have your message encryption key.')
+      const encrypted = await encryptText(content, user.public_key, activeConversation.other_user.public_key)
+      const sent = normalizeMessage(await api.sendMessage(token, activeId, encrypted), user.id)
       setMessages((current) => ({ ...current, [activeId]: upsertMessage(current[activeId], sent) }))
     } catch (requestError) {
       setError(requestError.message)
@@ -152,7 +172,9 @@ export default function ChatPage({ session, onLogout }) {
   async function sendImage(file) {
     setError('')
     try {
-      const sent = normalizeMessage(await api.sendImage(token, activeId, file), user.id)
+      if (!await hasIdentity(user)) throw new Error('This browser does not have your image encryption key.')
+      const encrypted = await encryptImage(file, user.public_key, activeConversation.other_user.public_key)
+      const sent = normalizeMessage(await api.sendImage(token, activeId, encrypted), user.id)
       setMessages((current) => ({ ...current, [activeId]: upsertMessage(current[activeId], sent) }))
     } catch (requestError) {
       setError(requestError.message)
@@ -164,7 +186,7 @@ export default function ChatPage({ session, onLogout }) {
   return (
     <div className="app-shell">
       <Sidebar conversations={conversations} activeId={activeId} onSelect={selectConversation} onNew={() => setSearchOpen(true)} user={user} onLogout={onLogout} connectionState={connectionState} mobileOpen={mobileOpen} />
-      <ConversationPanel conversation={activeConversation} messages={messages[activeId] || []} userId={user.id} token={token} loading={loadingConversationId === activeId} typing={typingByConversation[activeId]} onOpen={openMessage} onSend={sendMessage} onSendImage={sendImage} onTyping={(isTyping) => send(isTyping ? 'typing:start' : 'typing:stop', { conversation_id: activeId })} onBack={() => setMobileOpen(true)} error={error} />
+      <ConversationPanel conversation={activeConversation} messages={messages[activeId] || []} user={user} token={token} loading={loadingConversationId === activeId} typing={typingByConversation[activeId]} onOpen={openMessage} onSend={sendMessage} onSendImage={sendImage} onTyping={(isTyping) => send(isTyping ? 'typing:start' : 'typing:stop', { conversation_id: activeId })} onBack={() => setMobileOpen(true)} error={error} />
       {searchOpen && <SearchDialog onClose={() => setSearchOpen(false)} onStart={startConversation} />}
     </div>
   )

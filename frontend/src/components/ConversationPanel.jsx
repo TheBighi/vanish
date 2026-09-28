@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import MessageBubble from './MessageBubble.jsx'
 
-export default function ConversationPanel({ conversation, messages, userId, token, loading, typing, onOpen, onSend, onSendImage, onTyping, onBack, error }) {
+export default function ConversationPanel({ conversation, messages, user, token, loading, typing, onOpen, onSend, onSendImage, onTyping, onBack, error }) {
   const [content, setContent] = useState('')
   const [sending, setSending] = useState(false)
   const endRef = useRef(null)
@@ -68,7 +68,7 @@ export default function ConversationPanel({ conversation, messages, userId, toke
         <div className="message-date">Open a message only when you are ready to read it.</div>
         {loading && <div className="loading-messages">Loading messages…</div>}
         {!loading && messages.length === 0 && <div className="first-message">No messages yet.</div>}
-        {messages.map((message) => <MessageBubble key={message.id} message={message} mine={message.sender_id === userId} token={token} onOpen={onOpen} />)}
+        {messages.map((message) => <MessageBubble key={message.id} message={message} mine={message.sender_id === user.id} user={user} token={token} onOpen={onOpen} />)}
         {typing && <div className="typing-bubble"><i /><i /><i /></div>}
         <div ref={endRef} />
       </section>
